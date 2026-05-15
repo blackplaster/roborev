@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -96,6 +97,39 @@ func TestCodexBuildArgsWithSessionResume(t *testing.T) {
 	}, args)
 }
 
+func TestCodexBuildArgsCanDisableSkills(t *testing.T) {
+	a := WithCodexSkillsDisabled(NewCodexAgent("codex"), true).(*CodexAgent)
+
+	args := a.buildArgs("/repo", false, true, false, "")
+
+	assert.Contains(t, args, "-c")
+	assert.Contains(t, args, "skills.include_instructions=false")
+}
+
+func TestCodexBuildArgsLeavesSkillsEnabledByDefault(t *testing.T) {
+	a := NewCodexAgent("codex")
+
+	args := a.buildArgs("/repo", false, true, false, "")
+
+	assert.NotContains(t, args, "skills.include_instructions=false")
+}
+
+func TestCodexBuildArgsCanIgnoreUserConfig(t *testing.T) {
+	a := WithCodexUserConfigIgnored(NewCodexAgent("codex"), true).(*CodexAgent)
+
+	args := a.buildArgs("/repo", false, true, false, "")
+
+	assert.Contains(t, args, codexIgnoreUserConfigFlag)
+}
+
+func TestCodexBuildArgsLoadsUserConfigByDefault(t *testing.T) {
+	a := NewCodexAgent("codex")
+
+	args := a.buildArgs("/repo", false, true, false, "")
+
+	assert.NotContains(t, args, codexIgnoreUserConfigFlag)
+}
+
 func TestCodexBuildArgsAddsDiffSnapshotDirectory(t *testing.T) {
 	a := NewCodexAgent("codex")
 	snapshotDir, err := os.MkdirTemp("", "roborev-snapshot-*")
@@ -164,9 +198,53 @@ func TestCodexCommandLineOmitsRuntimeOnlyArgs(t *testing.T) {
 func TestCodexSupportsDangerousFlagAllowsNonZeroHelp(t *testing.T) {
 	cmdPath := writeTempCommand(t, "#!/bin/sh\necho \"usage "+codexDangerousFlag+"\"; exit 1\n")
 
-	supported, err := codexSupportsDangerousFlag(context.Background(), cmdPath)
+	supported, err := codexSupportsDangerousFlag(context.Background(), cmdPath, false)
 	require.NoError(t, err)
 	assert.True(t, supported, "expected dangerous flag support")
+}
+
+func TestCodexSupportsIgnoreUserConfigDetectsSupport(t *testing.T) {
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$*" in
+  "exec --ignore-user-config --help") echo "usage --ignore-user-config"; exit 0;;
+esac
+echo "unexpected args: $*" >&2
+exit 1
+`)
+
+	supported, err := codexSupportsIgnoreUserConfig(context.Background(), cmdPath)
+	require.NoError(t, err)
+	assert.True(t, supported, "expected ignore-user-config support")
+}
+
+func TestCodexSupportsIgnoreUserConfigTreatsDirectProbeErrorsAsUnsupported(t *testing.T) {
+	cases := []struct {
+		name     string
+		errorMsg string
+	}{
+		{"unknown flag", "error: unknown flag: --ignore-user-config"},
+		{"no such option", "error: no such option: --ignore-user-config"},
+		{"invalid option", "error: invalid option '--ignore-user-config'"},
+		{"clap wasn't expected", "error: the argument '--ignore-user-config' wasn't expected"},
+		{"bare bad option", "error: bad option --ignore-user-config"},
+		{"echoes flag in plain help", "usage --ignore-user-config"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			script := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  "exec --ignore-user-config --help") echo %q >&2; exit 2;;
+esac
+echo "unexpected args: $*" >&2
+exit 1
+`, tc.errorMsg)
+			cmdPath := writeTempCommand(t, script)
+
+			supported, err := codexSupportsIgnoreUserConfig(context.Background(), cmdPath)
+			require.NoError(t, err)
+			assert.False(t, supported, "expected %q to be treated as unsupported", tc.errorMsg)
+		})
+	}
 }
 
 func TestCodexReviewUnsafeMissingFlagErrors(t *testing.T) {
@@ -176,6 +254,59 @@ func TestCodexReviewUnsafeMissingFlagErrors(t *testing.T) {
 	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not support")
+}
+
+func TestCodexReviewIncludesIgnoreUserConfigWhenSupported(t *testing.T) {
+	a, mock := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox " + codexIgnoreUserConfigFlag,
+		CaptureArgs: true,
+		StdoutLines: []string{
+			`{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}`,
+		},
+	})
+	a = WithCodexUserConfigIgnored(a, true).(*CodexAgent)
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.NoError(t, err)
+
+	args := readMockArgs(t, mock.ArgsFile)
+	assertContainsArg(t, args, codexIgnoreUserConfigFlag)
+}
+
+func TestCodexReviewUsesIgnoreUserConfigForPreflightChecks(t *testing.T) {
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$*" in
+  *--help*)
+    case "$*" in
+      *--ignore-user-config*) echo "usage --sandbox --ignore-user-config"; exit 0;;
+    esac
+    echo "broken config" >&2
+    exit 1
+    ;;
+esac
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+`)
+	a := WithCodexUserConfigIgnored(NewCodexAgent(cmdPath), true).(*CodexAgent)
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.NoError(t, err)
+}
+
+func TestCodexReviewOmitsIgnoreUserConfigWhenUnsupported(t *testing.T) {
+	a, mock := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox",
+		CaptureArgs: true,
+		StdoutLines: []string{
+			`{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}`,
+		},
+	})
+	a = WithCodexUserConfigIgnored(a, true).(*CodexAgent)
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.NoError(t, err)
+
+	args := readMockArgs(t, mock.ArgsFile)
+	assertNotContainsArg(t, args, codexIgnoreUserConfigFlag)
 }
 
 func TestCodexReviewUsesSandboxNone(t *testing.T) {
