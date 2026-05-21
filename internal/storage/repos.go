@@ -91,7 +91,7 @@ func (db *DB) GetOrCreateRepo(rootPath string, identity ...string) (*Repo, error
 		}
 		return &repo, nil
 	}
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 
@@ -381,7 +381,7 @@ func (db *DB) MoveRepo(repoID int64, newPath, newIdentity string) error {
 	if err == nil && existingID != repoID {
 		return ErrRepoPathConflict
 	}
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check path conflict: %w", err)
 	}
 
@@ -450,7 +450,7 @@ func (db *DB) FindRepo(identifier string) (*Repo, error) {
 	if err == nil {
 		return repo, nil
 	}
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 
