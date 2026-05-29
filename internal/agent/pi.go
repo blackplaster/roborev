@@ -11,16 +11,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"go.kenn.io/roborev/internal/config"
 )
 
 // PiAgent runs code reviews using the pi CLI
 type PiAgent struct {
-	Command   string         // The pi command to run (default: "pi")
-	Model     string         // Model to use (provider/model format or just model)
-	Provider  string         // Explicit provider (optional)
-	Reasoning ReasoningLevel // Reasoning level
-	Agentic   bool           // Agentic mode
-	SessionID string         // Existing session ID to resume
+	Command             string         // The pi command to run (default: "pi")
+	Model               string         // Model to use (provider/model format or just model)
+	Provider            string         // Explicit provider (optional)
+	Reasoning           ReasoningLevel // Reasoning level
+	Agentic             bool           // Agentic mode
+	SessionID           string         // Existing session ID to resume
+	JSONSchemaExtension string         // Pi extension source for classifier schema output
 }
 
 // NewPiAgent creates a new pi agent
@@ -28,7 +31,11 @@ func NewPiAgent(command string) *PiAgent {
 	if command == "" {
 		command = "pi"
 	}
-	return &PiAgent{Command: command, Reasoning: ReasoningStandard}
+	return &PiAgent{
+		Command:             command,
+		Reasoning:           ReasoningStandard,
+		JSONSchemaExtension: config.DefaultPiJSONSchemaExtension,
+	}
 }
 
 func (a *PiAgent) clone(opts ...agentCloneOption) *PiAgent {
@@ -41,12 +48,13 @@ func (a *PiAgent) clone(opts ...agentCloneOption) *PiAgent {
 		opts...,
 	)
 	return &PiAgent{
-		Command:   cfg.Command,
-		Model:     cfg.Model,
-		Provider:  a.Provider,
-		Reasoning: cfg.Reasoning,
-		Agentic:   cfg.Agentic,
-		SessionID: cfg.SessionID,
+		Command:             cfg.Command,
+		Model:               cfg.Model,
+		Provider:            a.Provider,
+		Reasoning:           cfg.Reasoning,
+		Agentic:             cfg.Agentic,
+		SessionID:           cfg.SessionID,
+		JSONSchemaExtension: a.JSONSchemaExtension,
 	}
 }
 
@@ -122,6 +130,100 @@ func (a *PiAgent) thinkingLevel() string {
 	default: // Standard
 		return "medium"
 	}
+}
+
+func (a *PiAgent) classifyArgs(promptPath, outputPath string, schema json.RawMessage) []string {
+	args := []string{
+		"--no-session",
+		"--no-extensions",
+		"--no-builtin-tools",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-themes",
+		"--no-context-files",
+		"--extension", a.jsonSchemaExtension(),
+		"--json-schema", string(schema),
+		"--json-output", outputPath,
+		"--json-fallback", "none",
+		"-p",
+	}
+	if a.Provider != "" {
+		args = append(args, "--provider", a.Provider)
+	}
+	if a.Model != "" {
+		args = append(args, "--model", a.Model)
+	}
+	if level := a.thinkingLevel(); level != "" {
+		args = append(args, "--thinking", level)
+	}
+	return append(args,
+		"@"+promptPath,
+		"Classify according to the attached instructions and write the result with the structured JSON output tool.",
+	)
+}
+
+func (a *PiAgent) jsonSchemaExtension() string {
+	if ext := strings.TrimSpace(a.JSONSchemaExtension); ext != "" {
+		return ext
+	}
+	return config.DefaultPiJSONSchemaExtension
+}
+
+// ClassifyWithSchema runs a single constrained Pi invocation and returns the
+// JSON document written by the pi-json-schema extension. The invocation disables
+// builtin tools, extension discovery, skills, prompt templates, themes, context
+// file discovery, and session persistence; only the explicit schema-output
+// extension is loaded.
+func (a *PiAgent) ClassifyWithSchema(
+	ctx context.Context,
+	repoPath, gitRef, prompt string,
+	schema json.RawMessage,
+	out io.Writer,
+) (json.RawMessage, error) {
+	tmpDir, err := os.MkdirTemp("", "roborev-pi-classify-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp classify dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
+		return nil, fmt.Errorf("write classify prompt: %w", err)
+	}
+	outputPath := filepath.Join(tmpDir, "result.json")
+
+	args := a.classifyArgs(promptPath, outputPath, schema)
+	cmd := exec.CommandContext(ctx, a.Command, args...)
+	cmd.Dir = repoPath
+	tracker := configureSubprocess(cmd)
+
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	if out != nil {
+		sw := newSyncWriter(out)
+		cmd.Stdout = io.MultiWriter(&stdoutBuf, sw)
+		cmd.Stderr = io.MultiWriter(&stderrBuf, sw)
+	} else {
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+	}
+
+	if err := cmd.Run(); err != nil {
+		if ctxErr := contextProcessError(ctx, tracker, err, nil); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("pi classifier failed: %w\nstderr: %s", err, strings.TrimSpace(stderrBuf.String()))
+	}
+
+	result, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("read pi classifier output: %w", err)
+	}
+	result = bytes.TrimSpace(result)
+	if !json.Valid(result) {
+		return nil, fmt.Errorf("pi classifier output is not valid JSON: %q", string(result))
+	}
+	return json.RawMessage(result), nil
 }
 
 func (a *PiAgent) Review(
@@ -277,3 +379,5 @@ func parsePiJSON(r io.Reader) (string, error) {
 func init() {
 	Register(NewPiAgent(""))
 }
+
+var _ SchemaAgent = (*PiAgent)(nil)
