@@ -1,20 +1,122 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
+
+func TestHandleResolveRepo(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewTestRepo(t)
+	identity := "https://github.com/test/resolve-repo.git"
+	registeredRoot, err := gitrepo.MainRoot(context.Background(), repo.Root)
+	require.NoError(t, err)
+	stored, err := db.GetOrCreateRepo(registeredRoot, identity)
+	require.NoError(t, err)
+
+	t.Run("tracked repo returns repo metadata", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/api/repos/resolve?path="+url.QueryEscape(repo.Root),
+			nil,
+		)
+		w := httptest.NewRecorder()
+
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		testutil.AssertStatusCode(t, w, http.StatusOK)
+
+		var response struct {
+			Tracked bool `json:"tracked"`
+			Repo    *struct {
+				RootPath string `json:"root_path"`
+				Identity string `json:"identity"`
+				Name     string `json:"name"`
+			} `json:"repo,omitempty"`
+		}
+		testutil.DecodeJSON(t, w, &response)
+
+		require.True(t, response.Tracked)
+		require.NotNil(t, response.Repo)
+		assert.Equal(t, stored.RootPath, response.Repo.RootPath)
+		assert.Equal(t, identity, response.Repo.Identity)
+		assert.Equal(t, stored.Name, response.Repo.Name)
+	})
+
+	t.Run("path inside tracked repo resolves to root", func(t *testing.T) {
+		nestedPath := filepath.Join(stored.RootPath, "src", "pkg")
+		require.NoError(t, os.MkdirAll(nestedPath, 0o755))
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/api/repos/resolve?path="+url.QueryEscape(nestedPath),
+			nil,
+		)
+		w := httptest.NewRecorder()
+
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		testutil.AssertStatusCode(t, w, http.StatusOK)
+
+		var response struct {
+			Tracked bool `json:"tracked"`
+			Repo    *struct {
+				RootPath string `json:"root_path"`
+			} `json:"repo,omitempty"`
+		}
+		testutil.DecodeJSON(t, w, &response)
+
+		require.True(t, response.Tracked)
+		require.NotNil(t, response.Repo)
+		assert.Equal(t, stored.RootPath, response.Repo.RootPath)
+	})
+
+	t.Run("unknown repo returns untracked", func(t *testing.T) {
+		unknownPath := filepath.Join(t.TempDir(), "unknown-repo")
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/api/repos/resolve?path="+url.QueryEscape(unknownPath),
+			nil,
+		)
+		w := httptest.NewRecorder()
+
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		testutil.AssertStatusCode(t, w, http.StatusOK)
+
+		var response struct {
+			Tracked bool `json:"tracked"`
+			Repo    any  `json:"repo,omitempty"`
+		}
+		testutil.DecodeJSON(t, w, &response)
+
+		assert.False(t, response.Tracked)
+		assert.Nil(t, response.Repo)
+	})
+
+	t.Run("missing path returns client error", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/repos/resolve", nil)
+		w := httptest.NewRecorder()
+
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		testutil.AssertStatusCode(t, w, http.StatusBadRequest)
+		assert.Contains(t, w.Body.String(), "path is required")
+	})
+}
 
 func TestHandleListRepos(t *testing.T) {
 	server, db, tmpDir := newTestServer(t)
