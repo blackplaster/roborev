@@ -54,8 +54,9 @@ type WorkerPool struct {
 	// field directly after construction (test-only access).
 	classify agent.LimitClassifier
 
-	// tokenUsageFetcher looks up captured session usage. Defaults to
-	// tokens.FetchForSession; tests substitute a deterministic fetcher.
+	// tokenUsageFetcher looks up captured session usage. Nil uses the
+	// configured tokens.FetchForSessionWithConfig path; tests substitute a
+	// deterministic fetcher.
 	tokenUsageFetcher func(context.Context, string) (*tokens.Usage, error)
 
 	// Output capture for tail command
@@ -77,21 +78,20 @@ type WorkerPool struct {
 // NewWorkerPool creates a new worker pool
 func NewWorkerPool(db *storage.DB, cfgGetter ConfigGetter, numWorkers int, broadcaster Broadcaster, errorLog *ErrorLog, activityLog *ActivityLog) *WorkerPool {
 	return &WorkerPool{
-		db:                db,
-		cfgGetter:         cfgGetter,
-		broadcaster:       broadcaster,
-		errorLog:          errorLog,
-		activityLog:       activityLog,
-		numWorkers:        numWorkers,
-		stopCh:            make(chan struct{}),
-		readyCh:           make(chan struct{}),
-		runningJobs:       make(map[int64]context.CancelFunc),
-		pendingCancels:    make(map[int64]bool),
-		agentCooldowns:    make(map[string]time.Time),
-		outputBuffers:     NewOutputBuffer(512*1024, 4*1024*1024), // 512KB/job, 4MB total
-		classify:          agent.ClassifyLimit,
-		tokenUsageFetcher: tokens.FetchForSession,
-		retryBackoff:      2 * time.Second,
+		db:             db,
+		cfgGetter:      cfgGetter,
+		broadcaster:    broadcaster,
+		errorLog:       errorLog,
+		activityLog:    activityLog,
+		numWorkers:     numWorkers,
+		stopCh:         make(chan struct{}),
+		readyCh:        make(chan struct{}),
+		runningJobs:    make(map[int64]context.CancelFunc),
+		pendingCancels: make(map[int64]bool),
+		agentCooldowns: make(map[string]time.Time),
+		outputBuffers:  NewOutputBuffer(512*1024, 4*1024*1024), // 512KB/job, 4MB total
+		classify:       agent.ClassifyLimit,
+		retryBackoff:   2 * time.Second,
 	}
 }
 
@@ -1137,7 +1137,16 @@ func (wp *WorkerPool) captureTokenUsageForSession(
 	}
 	fetcher := wp.tokenUsageFetcher
 	if fetcher == nil {
-		fetcher = tokens.FetchForSession
+		cfg := wp.cfgGetter.Config()
+		fetcher = func(ctx context.Context, sessionID string) (*tokens.Usage, error) {
+			return tokens.FetchForSessionWithConfig(
+				ctx, sessionID,
+				tokens.FetchConfig{
+					Endpoint: cfg.Cost.Endpoint,
+					Timeout:  cfg.Cost.ResolvedTimeout(),
+				},
+			)
+		}
 	}
 	usage, tokenErr := fetcher(ctx, capturedSession)
 	if tokenErr != nil {

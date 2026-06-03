@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/tokens"
 )
@@ -24,6 +25,12 @@ and attempt to fetch token consumption from agentsview.
 This is best-effort: jobs whose session files have been deleted
 will be skipped.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.LoadGlobal()
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			fetchConfig := backfillCostFetchConfig(cfg)
+
 			db, err := storage.Open(storage.DefaultDBPath())
 			if err != nil {
 				return fmt.Errorf("open database: %w", err)
@@ -46,8 +53,8 @@ will be skipped.`,
 				ctx, cancel := context.WithTimeout(
 					context.Background(), 15*time.Second,
 				)
-				usage, fetchErr := tokens.FetchForSession(
-					ctx, job.SessionID,
+				usage, fetchErr := tokens.FetchForSessionWithConfig(
+					ctx, job.SessionID, fetchConfig,
 				)
 				cancel()
 
@@ -62,17 +69,18 @@ will be skipped.`,
 					skipped++
 					continue
 				}
+				mergedUsage := mergeBackfillTokenUsage(job.TokenUsage, usage)
 
 				if dryRun {
 					fmt.Printf(
 						"job %d (%s): %s\n",
-						job.ID, job.Agent, usage.FormatSummary(),
+						job.ID, job.Agent, mergedUsage.FormatSummary(),
 					)
 					updated++
 					continue
 				}
 
-				j := tokens.ToJSON(usage)
+				j := tokens.ToJSON(mergedUsage)
 				if err := db.SaveJobTokenUsage(job.ID, j); err != nil {
 					log.Printf(
 						"job %d: save error: %v", job.ID, err,
@@ -83,7 +91,7 @@ will be skipped.`,
 				updated++
 				fmt.Printf(
 					"job %d (%s): %s\n",
-					job.ID, job.Agent, usage.FormatSummary(),
+					job.ID, job.Agent, mergedUsage.FormatSummary(),
 				)
 			}
 
@@ -104,6 +112,16 @@ will be skipped.`,
 		"show what would be updated without writing",
 	)
 	return cmd
+}
+
+func backfillCostFetchConfig(cfg *config.Config) tokens.FetchConfig {
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+	}
+	return tokens.FetchConfig{
+		Endpoint: cfg.Cost.Endpoint,
+		Timeout:  cfg.Cost.ResolvedTimeout(),
+	}
 }
 
 // backfillCandidates filters jobs to those eligible for token
@@ -140,6 +158,27 @@ func backfillCandidates(
 		out = append(out, job)
 	}
 	return out
+}
+
+func mergeBackfillTokenUsage(existingJSON string, fetched *tokens.Usage) *tokens.Usage {
+	if fetched == nil {
+		return tokens.ParseJSON(existingJSON)
+	}
+	merged := *fetched
+	existing := tokens.ParseJSON(existingJSON)
+	if existing == nil {
+		return &merged
+	}
+
+	if merged.OutputTokens == 0 && merged.PeakContextTokens == 0 {
+		merged.OutputTokens = existing.OutputTokens
+		merged.PeakContextTokens = existing.PeakContextTokens
+	}
+	if !merged.HasCost && existing.HasCost {
+		merged.CostUSD = existing.CostUSD
+		merged.HasCost = true
+	}
+	return &merged
 }
 
 func needsTokenCostBackfill(tokenUsage string) bool {
