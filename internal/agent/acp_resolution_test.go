@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -137,5 +138,36 @@ func TestGetAvailableWithConfigACPAgent(t *testing.T) {
 		agent, err := GetAvailableWithConfig("", defaultACPName, cfg)
 		require.NoError(t, err)
 		assert.Equal(t, defaultACPName, agent.Name())
+	})
+}
+
+func TestGetAvailableWithConfigACPAsBackup(t *testing.T) {
+	// A configured ACP agent must be selectable as a backup agent, honoring
+	// [acp].command the same way the preferred-agent path does. The command is
+	// an absolute path so it stays resolvable while PATH is isolated below to
+	// make the preferred agent's default binary unavailable.
+	acpBin := filepath.Join(t.TempDir(), "fake-acp")
+	script := "#!/bin/sh\nexit 0\n"
+	if runtime.GOOS == "windows" {
+		acpBin += ".cmd"
+		script = "@echo off\r\nexit /b 0\r\n"
+	}
+	require.NoError(t, os.WriteFile(acpBin, []byte(script), 0o755))
+	t.Setenv("PATH", t.TempDir())
+
+	t.Run("literal acp backup honors [acp].command", func(t *testing.T) {
+		cfg := &config.Config{ACP: &config.ACPAgentConfig{Command: acpBin}}
+		// Preferred "codex" is unavailable on the isolated PATH; the "acp"
+		// backup must resolve through the configured-ACP path.
+		got, err := GetAvailableWithConfig("", "codex", cfg, defaultACPName)
+		require.NoError(t, err)
+		assert.Equal(t, defaultACPName, got.Name())
+	})
+
+	t.Run("custom [acp].name backup honors configured command", func(t *testing.T) {
+		cfg := &config.Config{ACP: &config.ACPAgentConfig{Name: "my-acp", Command: acpBin}}
+		got, err := GetAvailableWithConfig("", "codex", cfg, "my-acp")
+		require.NoError(t, err)
+		assert.Equal(t, defaultACPName, got.Name())
 	})
 }

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,63 @@ import (
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/tokens"
 )
+
+// showPanelMember is one reviewer in the additive show --json panel block.
+type showPanelMember struct {
+	JobID      int64  `json:"job_id"`
+	Name       string `json:"name"`
+	Agent      string `json:"agent"`
+	ReviewType string `json:"review_type"`
+	Status     string `json:"status"`
+	Verdict    string `json:"verdict,omitempty"`
+}
+
+// showPanelBlock is the additive "panel" object on show --json for a synthesis
+// (parent) review: the run handle plus its member reviewers.
+type showPanelBlock struct {
+	RunUUID        string            `json:"run_uuid"`
+	Name           string            `json:"name"`
+	SynthesisJobID int64             `json:"synthesis_job_id"`
+	Members        []showPanelMember `json:"members"`
+}
+
+// buildShowPanelBlock maps a run's member jobs to the panel block. Members are
+// assumed already ordered by panel_member_index.
+func buildShowPanelBlock(synthesisJobID int64, runUUID, name string, members []storage.ReviewJob) showPanelBlock {
+	block := showPanelBlock{RunUUID: runUUID, Name: name, SynthesisJobID: synthesisJobID}
+	for _, m := range members {
+		member := showPanelMember{
+			JobID:      m.ID,
+			Name:       m.PanelMemberName,
+			Agent:      m.Agent,
+			ReviewType: m.ReviewType,
+			Status:     string(m.Status),
+		}
+		if m.Verdict != nil {
+			member.Verdict = *m.Verdict
+		}
+		block.Members = append(block.Members, member)
+	}
+	return block
+}
+
+// formatReviewersSummary renders a one-line panel header for human output,
+// e.g. "3 reviewers: bug P, security F, design -" ('-' = no verdict yet).
+func formatReviewersSummary(members []storage.ReviewJob) string {
+	parts := make([]string, len(members))
+	for i, m := range members {
+		verdict := "-"
+		if m.Verdict != nil && *m.Verdict != "" {
+			verdict = *m.Verdict
+		}
+		name := m.PanelMemberName
+		if name == "" {
+			name = m.Agent
+		}
+		parts[i] = fmt.Sprintf("%s %s", name, verdict)
+	}
+	return fmt.Sprintf("%d reviewers: %s", len(members), strings.Join(parts, ", "))
+}
 
 func showCmd() *cobra.Command {
 	var forceJobID bool
@@ -123,9 +182,16 @@ Examples:
 				type reviewWithComments struct {
 					storage.Review
 					Comments []storage.Response `json:"comments,omitempty"`
+					Panel    *showPanelBlock    `json:"panel,omitempty"`
 				}
 				out := reviewWithComments{Review: review}
 				out.Comments = fetchShowComments(client, addr, review)
+				if review.Job != nil && review.Job.IsSynthesisJob() && review.Job.PanelRunUUID != "" {
+					if members, err := fetchPanelMembers(client, addr, review.Job.PanelRunUUID); err == nil && len(members) > 0 {
+						block := buildShowPanelBlock(review.JobID, review.Job.PanelRunUUID, review.Job.PanelName, members)
+						out.Panel = &block
+					}
+				}
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
 				return enc.Encode(&out)
@@ -140,6 +206,11 @@ Examples:
 			if review.Job != nil {
 				if tu := tokens.ParseJSON(review.Job.TokenUsage); tu != nil {
 					fmt.Printf("Tokens: %s\n", tu.FormatSummary())
+				}
+			}
+			if review.Job != nil && review.Job.IsSynthesisJob() && review.Job.PanelRunUUID != "" {
+				if members, err := fetchPanelMembers(client, addr, review.Job.PanelRunUUID); err == nil && len(members) > 0 {
+					fmt.Println(formatReviewersSummary(members))
 				}
 			}
 			fmt.Println(strings.Repeat("-", 60))
@@ -170,6 +241,41 @@ Examples:
 	return cmd
 }
 
+// fetchPanelMembers loads a panel run's member rows (ordered by member index)
+// via GET /api/jobs?panel_run=<uuid>. The endpoint returns members plus the
+// synthesis row; this keeps only members. limit=0 requests the full run so a
+// panel with >=50 rows is not truncated (the synthesis row also counts toward
+// the default cap).
+func fetchPanelMembers(client *http.Client, addr, runUUID string) ([]storage.ReviewJob, error) {
+	u := addr + "/api/jobs?panel_run=" + url.QueryEscape(runUUID) + "&limit=0"
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list panel members: server returned %s", resp.Status)
+	}
+
+	var result struct {
+		Jobs []storage.ReviewJob `json:"jobs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	var members []storage.ReviewJob
+	for _, j := range result.Jobs {
+		if j.PanelRole == storage.PanelRoleMember {
+			members = append(members, j)
+		}
+	}
+	sort.Slice(members, func(i, j int) bool {
+		return members[i].PanelMemberIndex < members[j].PanelMemberIndex
+	})
+	return members, nil
+}
+
 // fetchShowComments retrieves comments for a review, merging legacy
 // SHA-based comments via storage.MergeResponses.
 func fetchShowComments(client *http.Client, addr string, review storage.Review) []storage.Response {
@@ -194,10 +300,13 @@ func fetchShowComments(client *http.Client, addr string, review storage.Review) 
 	// Also fetch legacy commit-based comments and merge.
 	// Prefer commit_id (unambiguous), fall back to SHA for legacy jobs.
 	var legacyURL string
-	if review.Job != nil && review.Job.CommitID != nil {
-		legacyURL = addr + fmt.Sprintf("/api/comments?commit_id=%d", *review.Job.CommitID)
-	} else if review.Job != nil && gitrepo.LooksLikeSHA(review.Job.GitRef) {
-		legacyURL = addr + fmt.Sprintf("/api/comments?sha=%s", review.Job.GitRef)
+	if review.Job != nil {
+		commitID, fallbackSHA := review.Job.LegacyCommentLookupTarget()
+		if commitID > 0 {
+			legacyURL = addr + fmt.Sprintf("/api/comments?commit_id=%d", commitID)
+		} else if fallbackSHA != "" {
+			legacyURL = addr + fmt.Sprintf("/api/comments?sha=%s", fallbackSHA)
+		}
 	}
 	if legacyURL != "" {
 		if resp, err := client.Get(legacyURL); err != nil {

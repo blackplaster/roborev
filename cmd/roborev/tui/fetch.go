@@ -2,10 +2,12 @@ package tui
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	neturl "net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -556,12 +558,13 @@ func (m model) loadResponses(jobID int64, review *storage.Review) []storage.Resp
 	// Also fetch legacy commit-based responses and merge.
 	// Prefer commit_id (unambiguous), fall back to SHA for legacy jobs.
 	var legacyParams *daemonclient.ListCommentsParams
-	if review.Job != nil && review.Job.CommitID != nil {
-		commitID := *review.Job.CommitID
-		legacyParams = &daemonclient.ListCommentsParams{CommitId: &commitID}
-	} else if review.Job != nil && gitrepo.LooksLikeSHA(review.Job.GitRef) {
-		sha := review.Job.GitRef
-		legacyParams = &daemonclient.ListCommentsParams{Sha: &sha}
+	if review.Job != nil {
+		commitID, fallbackSHA := review.Job.LegacyCommentLookupTarget()
+		if commitID > 0 {
+			legacyParams = &daemonclient.ListCommentsParams{CommitId: &commitID}
+		} else if fallbackSHA != "" {
+			legacyParams = &daemonclient.ListCommentsParams{Sha: &fallbackSHA}
+		}
 	}
 	if legacyParams != nil {
 		var legacyResult struct {
@@ -671,6 +674,44 @@ func (m model) fetchReviewForPrompt(jobID int64) tea.Cmd {
 			return errMsg(err)
 		}
 		return promptMsg{review: review, jobID: jobID}
+	}
+}
+
+// fetchPanelMembers loads a panel run's member rows via GET /api/jobs?panel_run.
+// The generated client has no panel_run param, so this issues a raw request like
+// fetchJobLog (and show.go's fetchPanelMembers). The endpoint returns the full
+// run (members + synthesis); keep only members, sorted by member index. On error
+// the msg carries err and the handler leaves the panel uncached so a later
+// expand retries.
+func (m model) fetchPanelMembers(runUUID string) tea.Cmd {
+	baseURL := m.endpoint.BaseURL()
+	client := m.client
+	return func() tea.Msg {
+		url := fmt.Sprintf("%s/api/jobs?panel_run=%s&limit=0", baseURL, neturl.QueryEscape(runUUID))
+		resp, err := client.Get(url)
+		if err != nil {
+			return panelMembersMsg{runUUID: runUUID, err: err}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return panelMembersMsg{runUUID: runUUID, err: fmt.Errorf("list panel members: %s", resp.Status)}
+		}
+		var result struct {
+			Jobs []storage.ReviewJob `json:"jobs"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return panelMembersMsg{runUUID: runUUID, err: err}
+		}
+		members := make([]storage.ReviewJob, 0, len(result.Jobs))
+		for _, j := range result.Jobs {
+			if j.PanelRole == storage.PanelRoleMember {
+				members = append(members, j)
+			}
+		}
+		sort.Slice(members, func(i, j int) bool {
+			return members[i].PanelMemberIndex < members[j].PanelMemberIndex
+		})
+		return panelMembersMsg{runUUID: runUUID, members: members}
 	}
 }
 

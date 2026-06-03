@@ -16,6 +16,28 @@ var severityAbove = map[string]string{
 	"medium":   "Only include Medium, High, and Critical findings.",
 }
 
+// VerifyDedupePreamble returns the static instruction block shared by the CLI
+// compact command and the panel synthesis worker: verify each finding against
+// the current codebase, consolidate duplicates, and emit only verified
+// findings. The text is byte-preserved so both call sites emit identical
+// instructions.
+func VerifyDedupePreamble() string {
+	return "## Instructions\n\n" +
+		"1. **Verify each finding against the current codebase:**\n" +
+		"   - Search the codebase to check if the issue still exists\n" +
+		"   - Use wide code search patterns (grep, find files, read context)\n" +
+		"   - Mark findings as VERIFIED or FALSE_POSITIVE\n\n" +
+		"2. **Consolidate related findings:**\n" +
+		"   - Group findings that address the same underlying issue\n" +
+		"   - Merge duplicate findings from different reviews\n" +
+		"   - Provide a single comprehensive description for each group\n\n" +
+		"3. **Output format:**\n" +
+		"   - List only VERIFIED findings in your output\n" +
+		"   - Use the same severity levels (Critical, High, Medium, Low)\n" +
+		"   - Include file and line references where possible\n" +
+		"   - Explain what the issue is and why it matters\n\n"
+}
+
 // BuildSynthesisPrompt creates the prompt for the synthesis agent.
 // When minSeverity is non-empty (and not "low"), a filtering
 // instruction is appended.
@@ -27,6 +49,8 @@ func BuildSynthesisPrompt(
 	b.WriteString(
 		"You are combining multiple code review outputs " +
 			"into a single GitHub PR comment.\nRules:\n" +
+			"- Do not call tools or run commands\n" +
+			"- Only combine the input review results according to these rules\n" +
 			"- Deduplicate findings reported by multiple agents\n" +
 			"- Organize by severity (Critical > High > Medium > Low)\n" +
 			"- Preserve file/line references\n" +
@@ -55,6 +79,8 @@ func BuildSynthesisPrompt(
 			b.WriteString(" [SKIPPED]")
 		} else if IsQuotaFailure(r) {
 			b.WriteString(" [SKIPPED]")
+		} else if IsTransientFailure(r) {
+			b.WriteString(" [SKIPPED]")
 		} else if r.Status == ResultFailed {
 			b.WriteString(" [FAILED]")
 		}
@@ -68,6 +94,9 @@ func BuildSynthesisPrompt(
 		} else if IsQuotaFailure(r) {
 			b.WriteString(
 				"(review skipped — agent quota exhausted)")
+		} else if IsTransientFailure(r) {
+			b.WriteString(
+				"(review skipped — provider unavailable)")
 		} else if r.Output != "" {
 			output := r.Output
 			if len(output) > maxPerReview {
@@ -145,6 +174,8 @@ func FormatRawBatchComment(
 		status := r.Status
 		if IsQuotaFailure(r) {
 			status = "skipped (quota)"
+		} else if IsTransientFailure(r) {
+			status = "skipped (provider unavailable)"
 		} else if r.Skipped || r.Status == ResultSkipped {
 			status = "skipped (auto-design)"
 		}
@@ -160,6 +191,9 @@ func FormatRawBatchComment(
 		} else if IsQuotaFailure(r) {
 			b.WriteString(
 				"Review skipped — agent quota exhausted.\n\n")
+		} else if IsTransientFailure(r) {
+			b.WriteString(
+				"Review skipped — provider temporarily unavailable.\n\n")
 		} else if r.Status == ResultFailed {
 			b.WriteString(
 				"**Error:** Review failed. " +
@@ -193,8 +227,9 @@ func FormatAllFailedComment(
 ) string {
 	quotaSkips := CountQuotaFailures(reviews)
 	timeoutSkips := CountTimeoutCancellations(reviews)
+	transientSkips := CountTransientFailures(reviews)
 	allSkipped := len(reviews) > 0 &&
-		quotaSkips+timeoutSkips == len(reviews)
+		quotaSkips+timeoutSkips+transientSkips == len(reviews)
 
 	var b strings.Builder
 	if allSkipped {
@@ -203,7 +238,8 @@ func FormatAllFailedComment(
 			gitrepo.ShortSHA(headSHA))
 		b.WriteString(
 			"All review agents were skipped " +
-				"due to quota exhaustion or timeout.\n\n")
+				"due to quota exhaustion, timeout, or provider " +
+				"unavailability.\n\n")
 	} else {
 		fmt.Fprintf(&b,
 			"## roborev: Review Failed (`%s`)\n\n",
@@ -221,6 +257,10 @@ func FormatAllFailedComment(
 			fmt.Fprintf(&b,
 				"- **%s** (%s): skipped (timeout)\n",
 				r.Agent, r.ReviewType)
+		} else if IsTransientFailure(r) {
+			fmt.Fprintf(&b,
+				"- **%s** (%s): skipped (provider unavailable)\n",
+				r.Agent, r.ReviewType)
 		} else {
 			fmt.Fprintf(&b,
 				"- **%s** (%s): failed\n",
@@ -237,6 +277,46 @@ func FormatAllFailedComment(
 	}
 
 	return b.String()
+}
+
+// FormatTransientGiveUpComment is posted after the 3-day transient retry cap.
+// It explains that the AI provider was repeatedly unavailable and includes a
+// one-line excerpt of the last error encountered.
+func FormatTransientGiveUpComment(headSHA, lastErrExcerpt string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## roborev: Review Unavailable (`%s`)\n\n", gitrepo.ShortSHA(headSHA))
+	b.WriteString("roborev tried to review this PR for 3 days but the AI provider " +
+		"was repeatedly unavailable, so no review was produced.\n\n")
+	if strings.TrimSpace(lastErrExcerpt) != "" {
+		fmt.Fprintf(&b, "Last error: `%s`\n", oneLineExcerpt(lastErrExcerpt))
+	}
+	return b.String()
+}
+
+// FormatGenuineSoftNoteComment is posted after bounded genuine failures. It
+// notes the agent repeatedly failed to run and that roborev will retry on the
+// next commit, with a one-line excerpt of the last error.
+func FormatGenuineSoftNoteComment(headSHA, lastErrExcerpt string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## roborev: Review Unavailable (`%s`)\n\n", gitrepo.ShortSHA(headSHA))
+	b.WriteString("The review agent repeatedly failed to run (likely an agent or " +
+		"configuration error). roborev will try again on the next commit.\n\n")
+	if strings.TrimSpace(lastErrExcerpt) != "" {
+		fmt.Fprintf(&b, "Last error: `%s`\n", oneLineExcerpt(lastErrExcerpt))
+	}
+	return b.String()
+}
+
+// oneLineExcerpt flattens a message to a single line (newlines to spaces,
+// carriage returns dropped) and truncates to 200 bytes for inline display.
+func oneLineExcerpt(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", "")
+	s = strings.TrimSpace(s)
+	const max = 200
+	if len(s) > max {
+		s = strings.TrimRight(TrimPartialRune(s[:max]), " ") + "..."
+	}
+	return s
 }
 
 // IsQuotaFailure returns true if a review's error indicates a
