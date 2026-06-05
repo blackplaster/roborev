@@ -993,6 +993,29 @@ func TestGetDirtyDiffStagedThenDeleted(t *testing.T) {
 	assert.Contains(t, diff, "staged content", "expected staged diff to include content")
 }
 
+func TestGetDirtyFilesChangedIncludesExcludedDependencyMetadata(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+	repo.WriteFile("package-lock.json", "lock\n")
+	repo.WriteFile("go.sum", "sum\n")
+
+	files, err := GetDirtyFilesChanged(repo.Dir)
+	require.NoError(t, err)
+	assert.Contains(t, files, "go.sum")
+	assert.Contains(t, files, "package-lock.json")
+}
+
+func TestGetDirtyFilesChangedExpandsUntrackedDirectories(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+	repo.WriteFile("frontend/package-lock.json", "lock\n")
+	repo.WriteFile("frontend/src/index.js", "console.log('x')\n")
+
+	files, err := GetDirtyFilesChanged(repo.Dir)
+	require.NoError(t, err)
+	assert.Contains(t, files, "frontend/package-lock.json")
+	assert.Contains(t, files, "frontend/src/index.js")
+	assert.NotContains(t, files, "frontend/")
+}
+
 func TestFormatExcludeArgs(t *testing.T) {
 	assert.Nil(t, FormatExcludeArgs(nil))
 	assert.Nil(t, FormatExcludeArgs([]string{}))
@@ -1050,11 +1073,33 @@ func TestGetDiffExtraExcludes(t *testing.T) {
 	assert.NotContains(t, diff, "custom.lock")
 }
 
+func TestGetRangeDiffExcludesDependencyMetadataBodies(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+	repo.WriteFile("frontend/package.json", `{"dependencies":{"react":"18.2.0"}}`+"\n")
+	repo.WriteFile("frontend/package-lock.json", `{"packages":{"":{"dependencies":{"react":"18.2.0"}}}}`+"\n")
+	repo.WriteFile("go.mod", "module example.com/app\n\nrequire github.com/jackc/pgx/v5 v5.9.0\n")
+	repo.WriteFile("go.sum", "github.com/jackc/pgx/v5 v5.9.0 h1:old\n")
+	repo.CommitAll("add dependency metadata")
+
+	repo.WriteFile("frontend/package.json", `{"dependencies":{"react":"18.3.1"}}`+"\n")
+	repo.WriteFile("frontend/package-lock.json", `{"packages":{"":{"dependencies":{"react":"18.3.1"}}}}`+"\n")
+	repo.WriteFile("go.mod", "module example.com/app\n\nrequire github.com/jackc/pgx/v5 v5.10.0\n")
+	repo.WriteFile("go.sum", "github.com/jackc/pgx/v5 v5.10.0 h1:new\n")
+	repo.CommitAll("bump dependency metadata")
+
+	diff, err := GetRangeDiff(repo.Dir, "HEAD~1..HEAD")
+	require.NoError(t, err)
+	assert.Contains(t, diff, "frontend/package.json")
+	assert.Contains(t, diff, "go.mod")
+	assert.NotContains(t, diff, "frontend/package-lock.json")
+	assert.NotContains(t, diff, "go.sum")
+}
+
 func TestGetDiffExcludesNestedFiles(t *testing.T) {
 	// Verify that built-in and extra excludes work at any depth
 	repo := NewTestRepoWithCommit(t)
 	repo.WriteFile("keep.txt", "keep\n")
-	repo.WriteFile("sub/uv.lock", "nested builtin\n")
+	repo.WriteFile("sub/.cache/generated.txt", "nested builtin\n")
 	repo.WriteFile("sub/deep/custom.lock", "nested custom\n")
 	repo.CommitAll("add nested files")
 
@@ -1063,8 +1108,8 @@ func TestGetDiffExcludesNestedFiles(t *testing.T) {
 	diff, err := GetDiff(repo.Dir, sha, "custom.lock")
 	require.NoError(t, err)
 	assert.Contains(t, diff, "keep.txt")
-	assert.NotContains(t, diff, "uv.lock",
-		"built-in exclude should match nested uv.lock")
+	assert.NotContains(t, diff, ".cache/generated.txt",
+		"built-in exclude should match nested cache files")
 	assert.NotContains(t, diff, "custom.lock",
 		"extra exclude should match nested custom.lock")
 }
@@ -1074,8 +1119,8 @@ func setupDiffExcludesGeneratedFilesTest(t *testing.T) (*TestRepo, string) {
 	repo := NewTestRepoWithCommit(t)
 
 	repo.WriteFile(".beads/notes.md", "beads\n")
-	repo.WriteFile("uv.lock", "lock\n")
-	repo.WriteFile("go.sum", "sum\n")
+	repo.WriteFile(".gocache/object", "cache\n")
+	repo.WriteFile(".cache/object", "cache\n")
 	repo.WriteFile("keep.txt", "keep\n")
 
 	repo.CommitAll("add files")
@@ -1088,9 +1133,9 @@ func TestGetDiffExcludesGeneratedFiles(t *testing.T) {
 	assertExcluded := func(t *testing.T, diff string) {
 		t.Helper()
 		require.Contains(t, diff, "keep.txt", "expected generated files filter to retain keep.txt")
-		require.NotContains(t, diff, "uv.lock", "expected generated files filter to exclude uv.lock")
-		require.NotContains(t, diff, "go.sum", "expected generated files filter to exclude go.sum")
 		require.NotContains(t, diff, ".beads/", "expected generated files filter to exclude .beads files")
+		require.NotContains(t, diff, ".gocache/", "expected generated files filter to exclude .gocache files")
+		require.NotContains(t, diff, ".cache/", "expected generated files filter to exclude .cache files")
 	}
 
 	t.Run("GetDiff", func(t *testing.T) {
@@ -1243,7 +1288,7 @@ func TestGetDirtyDiffExcludesUntrackedFiles(t *testing.T) {
 		assert.NotContains(t, diff, "vendor/sub/util.go")
 	})
 
-	t.Run("builtin lockfiles", func(t *testing.T) {
+	t.Run("dependency metadata bodies are excluded", func(t *testing.T) {
 		repo := NewTestRepoWithCommit(t)
 		repo.WriteFile("keep.go", "package main\n")
 		repo.WriteFile("sub/uv.lock", "lock\n")

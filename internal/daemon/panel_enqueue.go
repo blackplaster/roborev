@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
+	"go.kenn.io/roborev/internal/prompt"
 	"go.kenn.io/roborev/internal/storage"
 )
 
@@ -31,6 +33,7 @@ type targetDescriptor struct {
 	sessionSHA        string // SHA to key session reuse on ("" for prompt jobs)
 	patchID           string
 	diffContent       string
+	dirtyFiles        []string
 	minSeverity       string
 	worktreePath      string
 	jobType           string // req.JobType for prompt; "" lets EnqueueJob infer dirty/range/review
@@ -50,7 +53,7 @@ type targetDescriptor struct {
 func (d targetDescriptor) baseOpts() storage.EnqueueOpts {
 	return storage.EnqueueOpts{
 		RepoID: d.repoID, CommitID: d.commitID, GitRef: d.gitRef, Branch: d.branch,
-		PatchID: d.patchID, DiffContent: d.diffContent, MinSeverity: d.minSeverity,
+		PatchID: d.patchID, DiffContent: d.diffContent, DirtyFiles: d.dirtyFiles, MinSeverity: d.minSeverity,
 		WorktreePath: d.worktreePath, JobType: d.jobType, Prompt: d.prompt,
 		PromptPrebuilt: d.promptPrebuilt, OutputPrefix: d.outputPrefix, Label: d.label,
 		Agentic: d.agentic, RequestedModel: d.requestedModel, RequestedProvider: d.requestedProvider,
@@ -198,7 +201,7 @@ func (s *Server) descriptorForPrompt(in freezeInputs) targetDescriptor {
 func (s *Server) descriptorForDirty(
 	ctx context.Context, in freezeInputs,
 ) (targetDescriptor, *RawJSONOutput) {
-	if in.req.DiffContent == "" {
+	if in.req.DiffContent == "" && !prompt.HasDependencyMetadataFiles(in.req.DirtyFiles) {
 		out, _ := rawJSONOutput(http.StatusBadRequest,
 			ErrorResponse{Error: "diff_content required for dirty review"})
 		return targetDescriptor{}, out
@@ -231,6 +234,8 @@ func (s *Server) descriptorForDirty(
 		branch:            in.req.Branch,
 		sessionSHA:        targetSHA,
 		diffContent:       in.req.DiffContent,
+		dirtyFiles:        slices.Clone(in.req.DirtyFiles),
+		jobType:           storage.JobTypeDirty,
 		minSeverity:       in.normalizedMinSev,
 		worktreePath:      in.worktreePath,
 		requestedModel:    in.requestedModel,
