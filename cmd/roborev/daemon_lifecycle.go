@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -20,6 +19,7 @@ import (
 
 	kitdaemon "go.kenn.io/kit/daemon"
 
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/version"
@@ -30,16 +30,30 @@ var (
 	pollStartInterval = 1 * time.Second
 	pollMaxInterval   = 5 * time.Second
 
-	// Update daemon restart controls - exposed for testing.
-	updateRestartWaitTimeout  = 2 * time.Second
+	// Update daemon restart controls - exposed for testing. The wait must
+	// absorb slow Windows cold starts (antivirus rescans a freshly updated
+	// binary) without falling into the force-kill path.
+	updateRestartWaitTimeout  = 10 * time.Second
 	updateRestartPollInterval = 200 * time.Millisecond
-	getAnyRunningDaemon       = daemon.GetAnyRunningDaemon
-	listAllRuntimes           = daemon.ListAllRuntimes
-	isPIDAliveForUpdate       = isPIDAliveForUpdateDefault
-	restartDaemonForEnsure    = restartDaemon
-	stopDaemonForUpdate       = stopDaemon
-	killAllDaemonsForUpdate   = killAllDaemons
-	startUpdatedDaemon        = func(binDir string) error {
+
+	// Probe retry controls for ensureDaemon - exposed for testing. A single
+	// failed probe must not trigger a destructive kill-and-restart: the
+	// daemon may be mid-startup or briefly too busy to answer.
+	ensureProbeAttempts   = 3
+	ensureProbeRetryDelay = 1 * time.Second
+
+	// daemonStartTimeout bounds how long startDaemon waits for a spawned
+	// daemon to become ready.
+	daemonStartTimeout      = 15 * time.Second
+	getAnyRunningDaemon     = daemon.GetAnyRunningDaemon
+	listAllRuntimes         = daemon.ListAllRuntimes
+	cleanupZombieDaemons    = daemon.CleanupZombieDaemons
+	isPIDAliveForUpdate     = isPIDAliveForUpdateDefault
+	restartDaemonForEnsure  = restartDaemon
+	startDaemonForEnsure    = startDaemon
+	stopDaemonForUpdate     = stopDaemon
+	killAllDaemonsForUpdate = killAllDaemons
+	startUpdatedDaemon      = func(binDir string) error {
 		newBinary := filepath.Join(binDir, "roborev")
 		if runtime.GOOS == "windows" {
 			newBinary += ".exe"
@@ -65,6 +79,32 @@ var (
 
 // ErrDaemonNotRunning indicates no daemon runtime file was found
 var ErrDaemonNotRunning = fmt.Errorf("daemon not running (no runtime file found)")
+
+type detachedDaemonOptions struct {
+	Executable      string
+	Args            []string
+	Env             []string
+	Stdout          io.Writer
+	Stderr          io.Writer
+	RefuseEphemeral bool
+}
+
+// probeDaemonWithRetry probes ep several times before reporting failure, so
+// transient unresponsiveness does not escalate into a daemon restart.
+func probeDaemonWithRetry(ep daemon.DaemonEndpoint, timeout time.Duration) (*daemon.PingInfo, error) {
+	var lastErr error
+	for attempt := range ensureProbeAttempts {
+		if attempt > 0 {
+			time.Sleep(ensureProbeRetryDelay)
+		}
+		probe, err := daemon.ProbeDaemon(ep, timeout)
+		if err == nil {
+			return probe, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
 
 // ErrJobNotFound indicates a job ID was not found during polling
 var ErrJobNotFound = fmt.Errorf("job not found")
@@ -188,7 +228,7 @@ func ensureDaemon() error {
 	// First check runtime files for any running daemon
 	if info, err := getAnyRunningDaemon(); err == nil {
 		if !skipVersionCheck {
-			probe, err := daemon.ProbeDaemon(info.Endpoint(), 2*time.Second)
+			probe, err := probeDaemonWithRetry(info.Endpoint(), 2*time.Second)
 			if err != nil {
 				if verbose {
 					fmt.Printf("Daemon probe failed, restarting...\n")
@@ -234,8 +274,12 @@ func ensureDaemon() error {
 		return nil
 	}
 
+	// Legacy pre-kit daemons are invisible to kit discovery because they do
+	// not serve /api/ping, but they can still hold the default port and DB.
+	cleanupZombieDaemons(ep)
+
 	// Start daemon in background
-	return startDaemon()
+	return startDaemonForEnsure()
 }
 
 func startDaemon() error {
@@ -260,18 +304,46 @@ func startDaemon() error {
 			if err != nil {
 				return fmt.Errorf("failed to find executable: %w", err)
 			}
-			return kitdaemon.StartDetached(ctx, kitdaemon.StartDetachedOptions{
+			stdout, stderr, closeLogs, err := openDetachedDaemonLogs()
+			if err != nil {
+				return err
+			}
+			defer closeLogs()
+			return startDetachedDaemon(ctx, detachedDaemonOptions{
 				Executable:      exe,
 				Args:            []string{"daemon", "run"},
 				Env:             filterGitEnv(os.Environ()),
+				Stdout:          stdout,
+				Stderr:          stderr,
 				RefuseEphemeral: os.Getenv("ROBOREV_TEST_ALLOW_AUTOSTART") != "1",
 			})
 		},
 	}
-	if _, _, err := manager.Ensure(context.Background(), 3*time.Second); err != nil {
+	if _, _, err := manager.Ensure(context.Background(), daemonStartTimeout); err != nil {
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 	return nil
+}
+
+func openDetachedDaemonLogs() (*os.File, *os.File, func(), error) {
+	logDir := filepath.Join(config.DataDir(), "logs")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return nil, nil, nil, fmt.Errorf("create daemon log directory: %w", err)
+	}
+	stdout, err := os.OpenFile(filepath.Join(logDir, "daemon.stdout.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open daemon stdout log: %w", err)
+	}
+	stderr, err := os.OpenFile(filepath.Join(logDir, "daemon.stderr.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		_ = stdout.Close()
+		return nil, nil, nil, fmt.Errorf("open daemon stderr log: %w", err)
+	}
+	closeLogs := func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+	}
+	return stdout, stderr, closeLogs, nil
 }
 
 // stopDaemon stops any running daemons.
@@ -304,20 +376,7 @@ func stopDaemon() error {
 // killAllDaemons kills any roborev daemon processes that might be running
 // This handles orphaned processes from old binaries or crashed restarts
 func killAllDaemons() {
-	if runtime.GOOS == "windows" {
-		// On Windows, use wmic to find daemon processes by command line
-		// and kill only those running "daemon run"
-		_ = exec.Command("wmic", "process", "where",
-			"commandline like '%roborev%daemon%run%'",
-			"call", "terminate").Run()
-	} else {
-		// On Unix, use pkill to kill all roborev daemon processes
-		// Use -f to match against full command line
-		_ = exec.Command("pkill", "-f", "roborev daemon run").Run()
-		time.Sleep(100 * time.Millisecond)
-		// Force kill any remaining
-		_ = exec.Command("pkill", "-9", "-f", "roborev daemon run").Run()
-	}
+	killAllDaemonsPlatform()
 	time.Sleep(200 * time.Millisecond)
 }
 
